@@ -16,10 +16,12 @@ contract of the retry wrapper:
 import time
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from hindsight_api.engine.embeddings import (
     EmbeddingRetryPolicy,
+    LiteLLMEmbeddings,
     LiteLLMSDKEmbeddings,
     _is_transient_embedding_error,
 )
@@ -308,3 +310,64 @@ class TestPolicyFromConfig:
 
         assert 3 <= policy.max_retries + 1 <= 5
         assert policy.budget_seconds <= 15.0
+
+
+class TestLiteLLMProxyEncodeRetries:
+    """
+    The `litellm` proxy provider is the sibling of `litellm-sdk` and shares the
+    retry wrapper. It needs its own coverage because it fails differently: the
+    proxy returns an ordinary HTTP response, so the 5xx only becomes an exception
+    when `raise_for_status()` runs — and that call had to move *inside* the
+    retried closure for a proxy 5xx to be retried rather than raised straight
+    through to the caller.
+    """
+
+    def _make_proxy(self, policy: EmbeddingRetryPolicy, batch_size: int = 100) -> LiteLLMEmbeddings:
+        emb = LiteLLMEmbeddings(
+            api_base="https://proxy.invalid",
+            api_key="test_key",
+            model="text-embedding-3-small",
+            batch_size=batch_size,
+            retry_policy=policy,
+        )
+        emb._client = MagicMock()
+        emb._dimension = 768
+        return emb
+
+    def _http_response(self, status_code: int, texts: list[str] | None = None) -> MagicMock:
+        response = MagicMock()
+        response.status_code = status_code
+        if status_code >= 400:
+            request = httpx.Request("POST", "https://proxy.invalid/embeddings")
+            error = httpx.HTTPStatusError(
+                f"{status_code} error", request=request, response=httpx.Response(status_code, request=request)
+            )
+            response.raise_for_status.side_effect = error
+        else:
+            response.json.return_value = {
+                "data": [{"embedding": [0.1] * 768, "index": i} for i in range(len(texts or []))]
+            }
+        return response
+
+    def test_proxy_5xx_is_retried_then_succeeds(self):
+        emb = self._make_proxy(FAST_POLICY)
+        texts = ["what did we decide about embeddings?"]
+        emb._client.post.side_effect = [
+            self._http_response(503),
+            self._http_response(200, texts),
+        ]
+
+        result = emb.encode(texts)
+
+        assert len(result) == 1
+        assert len(result[0]) == 768
+        assert emb._client.post.call_count == 2
+
+    def test_proxy_4xx_raises_immediately_without_retrying(self):
+        emb = self._make_proxy(FAST_POLICY)
+        emb._client.post.return_value = self._http_response(401)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            emb.encode(["query"])
+
+        assert emb._client.post.call_count == 1
